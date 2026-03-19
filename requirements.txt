@@ -1,0 +1,6 @@
+streamlit
+litellm
+pydantic
+pandas
+python-pptx
+openpyxl
