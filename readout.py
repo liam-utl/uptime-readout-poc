@@ -14,6 +14,12 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 import io
 import tempfile
+import math
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch
 
 # ── Pydantic model ──────────────────────────────────────────────────────────────
 
@@ -86,17 +92,18 @@ def run_litellm_call(
         model=model,
         api_key=api_key or None,
         messages=[
-            {"role": "system", "content": system},
+            # {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
         temperature=0,
+        top_p=0.0,
+        response_format=CompetencyResult,
     )
 
     raw = response.choices[0].message.content.strip()
-    # Strip possible ```json fences
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     data = json.loads(raw)
-    data["competency"] = competency_name  # enforce name from file
+    data["competency"] = competency_name
     return CompetencyResult(**data)
 
 
@@ -129,9 +136,70 @@ def evaluate_chat_log(
     return results
 
 
-# ── PowerPoint export ────────────────────────────────────────────────────────────
+def build_radar_chart(
+    filename: str,
+    comp_results: dict,
+    competency_names: list[str],
+) -> io.BytesIO:
+    """Render a radar chart for one chat log; return PNG bytes in a BytesIO buffer."""
+    scores = []
+    labels = []
+    for comp in competency_names:
+        res = comp_results.get(comp)
+        scores.append(res.score if isinstance(res, CompetencyResult) else 0)
+        labels.append(comp)
 
-def build_pptx(all_results: dict[str, dict], competency_names: list[str]) -> bytes:
+    N = len(labels)
+    angles = [2 * math.pi * i / N for i in range(N)]
+    angles += angles[:1]          # close the loop
+    scores_plot = scores + scores[:1]
+
+    fig, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+    fig.patch.set_facecolor("#F8F9FA")
+    ax.set_facecolor("#F8F9FA")
+
+    # Grid rings
+    ax.set_ylim(0, 5)
+    ax.set_yticks([1, 2, 3, 4, 5])
+    ax.set_yticklabels(["1", "2", "3", "4", "5"],
+                       fontsize=7, color="#ADB5BD")
+    ax.yaxis.set_tick_params(pad=2)
+
+    # Spoke labels
+    ax.set_xticks(angles[:-1])
+    wrapped = ["\n".join(l.split()) if len(l) > 12 else l for l in labels]
+    ax.set_xticklabels(wrapped, fontsize=9, color="#212529", fontweight="bold")
+
+    # Grid styling
+    ax.grid(color="#DEE2E6", linestyle="--", linewidth=0.8, alpha=0.9)
+    ax.spines["polar"].set_color("#CED4DA")
+
+    # Fill
+    ax.plot(angles, scores_plot, color="#4361EE", linewidth=2.2, linestyle="solid")
+    ax.fill(angles, scores_plot, color="#4361EE", alpha=0.20)
+
+    # Score dots
+    for ang, sc in zip(angles[:-1], scores):
+        color = ["#DC2626","#EA580C","#CA8A04","#16A34A","#059669"][sc - 1] if sc else "#ADB5BD"
+        ax.plot(ang, sc, "o", color=color, markersize=8, zorder=5)
+
+    average = sum(scores) / len(scores) if scores else 0
+    ax.set_title(Path(filename).stem + f" (Average: {average:.2f}/5)", fontsize=12, fontweight="bold",
+                 color="#212529", pad=16)
+    
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ── PowerPoint export ─────────────────────────────────────────────────────────
+
+def build_pptx(all_results: dict[str, dict], competency_names: list[str],
+               radar_buffers: dict[str, io.BytesIO]) -> bytes:
     prs = Presentation()
     prs.slide_width = Inches(13.33)
     prs.slide_height = Inches(7.5)
@@ -313,6 +381,44 @@ def build_pptx(all_results: dict[str, dict], competency_names: list[str]) -> byt
                       card_w - Inches(0.28), card_h - Inches(0.2),
                       size=9, color=SCORE_COLORS[1])
 
+    # ── Radar chart slides (max 3 per slide, evenly distributed) ─────────────────
+    MAX_PER_SLIDE = 3
+    items = list(radar_buffers.items())
+    n = len(items)
+
+    # Decide how many slides and how many charts each gets, spread as evenly as possible.
+    # e.g. 4 charts → 2 slides of 2; 5 → slides of 3+2; 6 → 2 slides of 3
+    n_slides = math.ceil(n / MAX_PER_SLIDE)
+    base, extra = divmod(n, n_slides)          # base per slide; first `extra` slides get +1
+    distribution = [base + (1 if i < extra else 0) for i in range(n_slides)]
+
+    chart_w = Inches(4.0)
+    chart_h = Inches(4.0)
+    chart_area_top = Inches(1.0)
+    chart_area_h = prs.slide_height - chart_area_top - Inches(0.2)
+
+    item_idx = 0
+    for slide_i, per_slide in enumerate(distribution):
+        radar_slide = prs.slides.add_slide(blank_layout)
+        rect(radar_slide, 0, 0, prs.slide_width, prs.slide_height, OFF_WHITE)
+        rect(radar_slide, 0, 0, prs.slide_width, Inches(0.85), ACCENT)
+        label(radar_slide,
+              f"Competency Radar Charts ({slide_i + 1}/{n_slides})",
+              Inches(0.35), Inches(0.15), prs.slide_width - Inches(0.7), Inches(0.6),
+              size=22, bold=True, color=WHITE)
+
+        # Evenly space `per_slide` charts horizontally
+        total_chart_w = per_slide * chart_w
+        h_gap = (prs.slide_width - total_chart_w) / (per_slide + 1)
+        cy = chart_area_top + (chart_area_h - chart_h) / 2   # vertically centred
+
+        for pos in range(per_slide):
+            fn, buf = items[item_idx]
+            cx = h_gap + pos * (chart_w + h_gap)
+            buf.seek(0)
+            radar_slide.shapes.add_picture(buf, cx, cy, chart_w, chart_h)
+            item_idx += 1
+
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
@@ -351,15 +457,15 @@ def build_markdown(all_results: dict, competency_names: list[str]) -> str:
 
 # ── Streamlit UI ─────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Uptime Competency Evaluator", page_icon="", layout="wide")
-st.title("Uptime Competency Evaluator")
+st.set_page_config(page_title="Uptime Labs Competency Readout Generator", layout="wide")
+st.title("Uptime Labs Competency Readout Generator")
 st.caption("Upload CSVs · load prompts from Markdown files · score with LiteLLM · export results")
 
 # ── Sidebar config ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Configuration")
-    model = st.text_input("LiteLLM model", value="gpt-5",
-                          help="e.g. gpt-4o, anthropic/claude-3-5-haiku-20241022, ollama/llama3")
+    model = st.text_input("LiteLLM model", value="gpt-4.1",
+                          help="e.g. gpt-4.1, anthropic/claude-3-5-haiku-20241022, ollama/llama3")
     api_key = st.text_input("API Key (optional if set in env)", type="password")
     max_workers = st.slider("Parallel threads per file", 1, 10, 4)
     prompt_dir = st.text_input("Prompt directory", value="prompts",
@@ -423,6 +529,7 @@ run_btn = st.button("Run Evaluation", type="primary",
 
 if run_btn:
     all_results: dict[str, dict] = {}
+    radar_buffers: dict[str, io.BytesIO] = {}
     competency_names = list(prompts.keys())
 
     progress = st.progress(0, text="Starting…")
@@ -447,12 +554,15 @@ if run_btn:
                 max_workers=max_workers,
             )
         all_results[csv_file.name] = result
+        radar_buffers[csv_file.name] = build_radar_chart(
+            csv_file.name, result, competency_names
+        )
         status_cols[file_idx].success(f"✅ {csv_file.name}")
         progress.progress((file_idx + 1) / len(csv_files),
                           text=f"Completed {file_idx + 1}/{len(csv_files)} files")
 
     progress.empty()
-    st.success("Evaluation complete!")
+    st.success("🎉 Evaluation complete!")
 
     # ── Summary table ────────────────────────────────────────────────────────────
     st.subheader("Summary Table")
@@ -472,10 +582,16 @@ if run_btn:
     summary_df = pd.DataFrame(table_data)
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    # ── Rationales expandable ────────────────────────────────────────────────────
+    st.subheader("Radar Charts")
+    radar_cols = st.columns(min(len(radar_buffers), 3))
+    for i, (fn, rbuf) in enumerate(radar_buffers.items()):
+        rbuf.seek(0)
+        radar_cols[i % 3].image(rbuf, use_container_width=True)
+
+    # ── Rationales expandable ─────────────────────────────────────────────────
     st.subheader("Detailed Rationales")
     for fn, comp_results in all_results.items():
-        with st.expander(f"📄 {fn}"):
+        with st.expander(f"{fn}"):
             for comp in competency_names:
                 res = comp_results.get(comp)
                 if isinstance(res, CompetencyResult):
@@ -491,14 +607,14 @@ if run_btn:
                 st.divider()
 
     # ── Exports ──────────────────────────────────────────────────────────────────
-    st.subheader("Export Results")
+    st.subheader("⬇Export Results")
     ecol1, ecol2 = st.columns(2)
 
     with ecol1:
         try:
-            pptx_bytes = build_pptx(all_results, competency_names)
+            pptx_bytes = build_pptx(all_results, competency_names, radar_buffers)
             st.download_button(
-                label="📥 Download PowerPoint (.pptx)",
+                label="Download PowerPoint (.pptx)",
                 data=pptx_bytes,
                 file_name="competency_evaluation.pptx",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -509,7 +625,7 @@ if run_btn:
     with ecol2:
         md_str = build_markdown(all_results, competency_names)
         st.download_button(
-            label="📥 Download Markdown (.md)",
+            label="Download Markdown (.md)",
             data=md_str.encode(),
             file_name="competency_evaluation.md",
             mime="text/markdown",
