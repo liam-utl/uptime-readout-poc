@@ -36,7 +36,7 @@ Example:
 - Did they use a mix of open and closed questions?
 - Did they cross-check their understanding with other responders?
 
-Provide an overall Internal Comms score (1–5).
+Provide an overall Internal Comms score (1–5), in addition to a conscise, 4-5 sentence rationale as to why this score was awarded.
 
 ### Chat Log
 {{chat_log}}

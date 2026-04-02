@@ -20,6 +20,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import FancyBboxPatch
+from loki_service import get_session_chat
+from dotenv import load_dotenv
 
 # ── Pydantic model ──────────────────────────────────────────────────────────────
 
@@ -504,28 +506,30 @@ with st.expander("Prompt files (Markdown)", expanded=True):
         st.success(f"Saved `{uploaded_prompt.name}` to `{prompt_dir}/`. Reload to refresh.")
 
 # ── CSV upload ───────────────────────────────────────────────────────────────────
-st.divider()
-csv_files = st.file_uploader(
-    "Upload chat log CSV files", type=["csv"], accept_multiple_files=True
-)
+# st.divider()
+# csv_files = st.file_uploader(
+#     "Upload chat log CSV files", type=["csv"], accept_multiple_files=True
+# )
 
-if csv_files:
-    st.subheader("Loaded Files")
-    preview_file = st.selectbox("Preview CSV", [f.name for f in csv_files])
-    for f in csv_files:
-        if f.name == preview_file:
-            try:
-                df_preview = load_csv_robust(f)
-                f.seek(0)
-                st.dataframe(df_preview.head(5), use_container_width=True)
-            except ValueError as e:
-                st.error(f"Could not preview file: {e}")
-            break
+# if csv_files:
+#     st.subheader("Loaded Files")
+#     preview_file = st.selectbox("Preview CSV", [f.name for f in csv_files])
+#     for f in csv_files:
+#         if f.name == preview_file:
+#             try:
+#                 df_preview = load_csv_robust(f)
+#                 f.seek(0)
+#                 st.dataframe(df_preview.head(5), width="stretch")
+#             except ValueError as e:
+#                 st.error(f"Could not preview file: {e}")
+#             break
 
 # ── Run evaluation ───────────────────────────────────────────────────────────────
 st.divider()
+session_ids = st.text_input(label="Session IDs (comma-separated)", key="session_ids",
+              help="Alternatively, upload CSVs with the chat logs. This field is ignored if CSVs are uploaded.")
 run_btn = st.button("Run Evaluation", type="primary",
-                    disabled=not csv_files or not prompts)
+                    disabled=not session_ids)
 
 if run_btn:
     all_results: dict[str, dict] = {}
@@ -533,33 +537,63 @@ if run_btn:
     competency_names = list(prompts.keys())
 
     progress = st.progress(0, text="Starting…")
-    status_cols = st.columns(len(csv_files))
+    
+    sessions = session_ids.split(",") if session_ids else []
 
-    for file_idx, csv_file in enumerate(csv_files):
-        csv_file.seek(0)
+    status_cols = st.columns(len(sessions))
+
+
+    for i, session_id in enumerate(sessions):
         try:
-            df = load_csv_robust(csv_file)
+            df = get_session_chat(session_id)
         except ValueError as parse_err:
-            status_cols[file_idx].error(f"❌ {csv_file.name}: {parse_err}")
+            status_cols[i].error(f"❌ {session_id}: {parse_err}")
             continue
-        status_cols[file_idx].info(f"⏳ {csv_file.name}")
+        status_cols[i].info(f"⏳ {session_id}")
 
-        with st.spinner(f"Evaluating **{csv_file.name}**…"):
+        with st.spinner(f"Evaluating **{session_id}**…"):
             result = evaluate_chat_log(
-                filename=csv_file.name,
+                filename=f"{session_id}.csv",
                 df=df,
                 prompts=prompts,
                 model=model,
                 api_key=api_key,
                 max_workers=max_workers,
             )
-        all_results[csv_file.name] = result
-        radar_buffers[csv_file.name] = build_radar_chart(
-            csv_file.name, result, competency_names
+        all_results[str(session_id)] = result
+        radar_buffers[str(session_id)] = build_radar_chart(
+            str(session_id), result, competency_names
         )
-        status_cols[file_idx].success(f"✅ {csv_file.name}")
-        progress.progress((file_idx + 1) / len(csv_files),
-                          text=f"Completed {file_idx + 1}/{len(csv_files)} files")
+        status_cols[i].success(f"✅ {session_id}")
+        progress.progress((i + 1) / len(sessions),
+                          text=f"Completed {i + 1}/{len(sessions)} files")
+        
+
+    # for file_idx, csv_file in enumerate(csv_files):
+    #     csv_file.seek(0)
+    #     try:
+    #         df = load_csv_robust(csv_file)
+    #     except ValueError as parse_err:
+    #         status_cols[file_idx].error(f"❌ {csv_file.name}: {parse_err}")
+    #         continue
+    #     status_cols[file_idx].info(f"⏳ {csv_file.name}")
+
+    #     with st.spinner(f"Evaluating **{csv_file.name}**…"):
+    #         result = evaluate_chat_log(
+    #             filename=csv_file.name,
+    #             df=df,
+    #             prompts=prompts,
+    #             model=model,
+    #             api_key=api_key,
+    #             max_workers=max_workers,
+    #         )
+    #     all_results[csv_file.name] = result
+    #     radar_buffers[csv_file.name] = build_radar_chart(
+    #         csv_file.name, result, competency_names
+    #     )
+    #     status_cols[file_idx].success(f"✅ {csv_file.name}")
+    #     progress.progress((file_idx + 1) / len(csv_files),
+    #                       text=f"Completed {file_idx + 1}/{len(csv_files)} files")
 
     progress.empty()
     st.success("🎉 Evaluation complete!")
@@ -568,7 +602,7 @@ if run_btn:
     st.subheader("Summary Table")
     table_data = {"Competency": competency_names}
     for fn, comp_results in all_results.items():
-        short = Path(fn).stem
+        short = fn
         table_data[short] = []
         for comp in competency_names:
             res = comp_results.get(comp)
@@ -580,13 +614,13 @@ if run_btn:
                 table_data[short].append("⚠️ Error")
 
     summary_df = pd.DataFrame(table_data)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
 
     st.subheader("Radar Charts")
     radar_cols = st.columns(min(len(radar_buffers), 3))
     for i, (fn, rbuf) in enumerate(radar_buffers.items()):
         rbuf.seek(0)
-        radar_cols[i % 3].image(rbuf, use_container_width=True)
+        radar_cols[i % 3].image(rbuf, width="stretch")
 
     # ── Rationales expandable ─────────────────────────────────────────────────
     st.subheader("Detailed Rationales")

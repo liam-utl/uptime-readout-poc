@@ -42,7 +42,7 @@ Examples:
 - Customer notifications
 - Support messaging
 
-Provide an overall External Comms score (1–5).
+Provide an overall External Comms score (1–5), in addition to a conscise, 4-5 sentence rationale as to why this score was awarded.
 
 ### Chat Log
 {{chat_log}}

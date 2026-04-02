@@ -69,7 +69,7 @@ If PLAYER declares resolution before restoration evidence appears:
 - Do NOT credit closure.
 - Record it in Notes as premature closure language.
 
-Provide an overall Incident Mechanics score (1–5).
+Provide an overall Incident Mechanics score (1–5), in addition to a conscise, 4-5 sentence rationale as to why this score was awarded.
 
 ### Chat Log
 {{chat_log}}

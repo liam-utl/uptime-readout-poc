@@ -26,7 +26,7 @@ Evaluate leadership and incident command behaviour.
 - Did they communicate with **confidence**?
 - Did they prioritize **action over endless investigation**?
 
-Provide an overall Commanding the Incident score (1–5).
+Provide an overall Commanding the Incident score (1–5), in addition to a conscise, 4-5 sentence rationale as to why this score was awarded.
 
 ### Chat Log
 {{chat_log}}
