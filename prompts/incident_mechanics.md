@@ -73,3 +73,11 @@ Provide an overall Incident Mechanics score (1–5), in addition to a conscise, 
 
 ### Chat Log
 {{chat_log}}
+
+### Output format
+Ensure your output is in the following format:
+{
+    "competency": "Incident Mechanics",
+    "score": integer score between 1-5,
+    "rationale: Rationale for the score.
+}

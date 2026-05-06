@@ -30,3 +30,11 @@ Provide an overall Commanding the Incident score (1–5), in addition to a consc
 
 ### Chat Log
 {{chat_log}}
+
+### Output format
+Ensure your output is in the following format:
+{
+    "competency": "Commanding the Incident",
+    "score": integer score between 1-5,
+    "rationale: Rationale for the score.
+}

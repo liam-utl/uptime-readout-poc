@@ -37,3 +37,21 @@ Run: `streamlit run team_checklist.py`
 
 ![alt text](image.png)
 
+---
+
+AWS Models
+
+Obtain releavnt AWS credentials by running:
+
+`tsh proxy aws --app awsconsole-prod`
+
+This will return:
+```
+AWS_ACCESS_KEY
+AWS_SECRET_ACCESS_KEY
+```
+
+Retrieve a list of Amazon Bedrock Models:
+`tsh aws bedrock list-foundation-models --region eu-west-1`
+
+`tsh aws bedrock list-inference-profiles --region eu-west-1`

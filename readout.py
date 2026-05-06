@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import re
 import glob
+import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
@@ -22,6 +23,34 @@ import matplotlib.patches as mpatches
 from matplotlib.patches import FancyBboxPatch
 from loki_service import get_session_chat
 from dotenv import load_dotenv
+import llm_models
+
+# ── Model list helpers ───────────────────────────────────────────────────────────
+litellm._turn_on_debug()
+
+def _bedrock_display_name(arn: str) -> str:
+    """Extract the model ID after the last '/' in a Bedrock ARN."""
+    return arn.split("/")[-1]
+
+def litellm_model_string(selected: str, provider: str) -> str:
+    """Return the correct model string for LiteLLM.
+    For Bedrock, selected is the full ARN — prefix with 'bedrock/'.
+    e.g. bedrock/arn:aws:bedrock:eu-west-1::foundation-model/google.gemma-3-4b-it
+    For OpenAI, selected is already the model name.
+    """
+    if provider == "Bedrock":
+        return f"bedrock/{selected}"
+    return selected
+
+# Build lookup structures from llm_models at module load time.
+# _model_options: list of (display_label, model_id, provider, use_params)
+_model_options: list[tuple[str, str, str, bool]] = []
+for _m, _use_params in llm_models.OPENAI_MODELS:
+    _model_options.append((f"[OpenAI] {_m}", _m, "OpenAI", _use_params))
+for _arn, _use_params in llm_models.BEDROCK_MODELS:
+    _display = _bedrock_display_name(_arn)
+    _model_options.append((f"[Bedrock] {_display}", _arn, "Bedrock", _use_params))
+
 
 # ── Pydantic model ──────────────────────────────────────────────────────────────
 
@@ -80,6 +109,8 @@ def run_litellm_call(
     chat_log_text: str,
     model: str,
     api_key: str,
+    aws_credentials: dict | None = None,
+    use_params: bool = True,
 ) -> CompetencyResult:
     """Inject chat log into prompt and call LiteLLM; parse result into pydantic model."""
     prompt = prompt_template.replace("{{chat_log}}", chat_log_text)
@@ -90,17 +121,50 @@ def run_litellm_call(
         "No markdown fences, no extra text."
     )
 
-    response = litellm.completion(
-        model=model,
-        api_key=api_key or None,
-        messages=[
-            # {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        top_p=0.0,
-        response_format=CompetencyResult,
-    )
+    # Inject credentials as environment variables for the duration of the call.
+    env_backup = {}
+
+    def _set_env(key: str, val: str):
+        if val:
+            env_backup[key] = os.environ.get(key)
+            os.environ[key] = val
+
+    if api_key:
+        _set_env("OPENAI_API_KEY", api_key)
+
+    if aws_credentials:
+        for key, val in aws_credentials.items():
+            _set_env(key, val)
+
+    print("LLM_MODEL", model)
+    if model.startswith("bedrock/"):
+        response_format = CompetencyResult.model_json_schema()
+    else:
+        response_format = CompetencyResult
+    try:
+        if use_params:
+            response = litellm.completion(
+                model= model,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                response_format=response_format
+            )
+        else:
+            response = litellm.completion(
+                model= model,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ]
+            )
+    finally:
+        # Restore original env vars
+        for key, original in env_backup.items():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
 
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
@@ -116,6 +180,8 @@ def evaluate_chat_log(
     model: str,
     api_key: str,
     max_workers: int,
+    aws_credentials: dict | None = None,
+    use_params: bool = True,
 ) -> dict[str, CompetencyResult | str]:
     """Run all competency prompts in parallel threads for one CSV."""
     chat_text = csv_to_text(df)
@@ -124,7 +190,7 @@ def evaluate_chat_log(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                run_litellm_call, name, tpl, chat_text, model, api_key
+                run_litellm_call, name, tpl, chat_text, model, api_key, aws_credentials, use_params
             ): name
             for name, tpl in prompts.items()
         }
@@ -466,9 +532,56 @@ st.caption("Upload CSVs · load prompts from Markdown files · score with LiteLL
 # ── Sidebar config ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Configuration")
-    model = st.text_input("LiteLLM model", value="gpt-4.1",
-                          help="e.g. gpt-4.1, anthropic/claude-3-5-haiku-20241022, ollama/llama3")
-    api_key = st.text_input("API Key (optional if set in env)", type="password")
+
+    _labels = [o[0] for o in _model_options]
+    _selected_idx = st.selectbox(
+        "Model",
+        options=range(len(_model_options)),
+        index=0,
+        format_func=lambda i: _model_options[i][0],
+        help="OpenAI models use your OpenAI API key. Bedrock models use AWS credentials.",
+    )
+    _, _selected_arn_or_name, selected_provider, selected_use_params = _model_options[_selected_idx]
+    model = litellm_model_string(_selected_arn_or_name, selected_provider)
+
+    st.divider()
+
+    # ── OpenAI credentials ───────────────────────────────────────────────────────
+    st.subheader("OpenAI")
+    api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        help="Required for OpenAI models. Leave blank if set via environment variable.",
+    )
+
+    st.divider()
+
+    # ── Bedrock credentials ──────────────────────────────────────────────────────
+    st.subheader("AWS Bedrock")
+    aws_access_key = st.text_input(
+        "AWS_ACCESS_KEY_ID",
+        type="password",
+        disabled=(selected_provider != "Bedrock"),
+    )
+    aws_secret_key = st.text_input(
+        "AWS_SECRET_ACCESS_KEY",
+        type="password",
+        disabled=(selected_provider != "Bedrock"),
+    )
+    aws_bearer_token = st.text_input(
+        "AWS_BEARER_TOKEN_BEDROCK",
+        type="password",
+        disabled=(selected_provider != "Bedrock"),
+    )
+
+    aws_credentials = {
+        "AWS_ACCESS_KEY_ID": aws_access_key,
+        "AWS_SECRET_ACCESS_KEY": aws_secret_key,
+        "AWS_BEARER_TOKEN_BEDROCK": aws_bearer_token,
+    } if selected_provider == "Bedrock" else None
+
+    st.divider()
+
     max_workers = st.slider("Parallel threads per file", 1, 10, 4)
     prompt_dir = st.text_input("Prompt directory", value="prompts",
                                help="Folder containing one .md file per competency")
@@ -505,95 +618,104 @@ with st.expander("Prompt files (Markdown)", expanded=True):
         dest.write_bytes(uploaded_prompt.read())
         st.success(f"Saved `{uploaded_prompt.name}` to `{prompt_dir}/`. Reload to refresh.")
 
-# ── CSV upload ───────────────────────────────────────────────────────────────────
-# st.divider()
-# csv_files = st.file_uploader(
-#     "Upload chat log CSV files", type=["csv"], accept_multiple_files=True
-# )
-
-# if csv_files:
-#     st.subheader("Loaded Files")
-#     preview_file = st.selectbox("Preview CSV", [f.name for f in csv_files])
-#     for f in csv_files:
-#         if f.name == preview_file:
-#             try:
-#                 df_preview = load_csv_robust(f)
-#                 f.seek(0)
-#                 st.dataframe(df_preview.head(5), width="stretch")
-#             except ValueError as e:
-#                 st.error(f"Could not preview file: {e}")
-#             break
-
-# ── Run evaluation ───────────────────────────────────────────────────────────────
+# ── Input mode + Run evaluation ──────────────────────────────────────────────────
 st.divider()
-session_ids = st.text_input(label="Session IDs (comma-separated)", key="session_ids",
-              help="Alternatively, upload CSVs with the chat logs. This field is ignored if CSVs are uploaded.")
-run_btn = st.button("Run Evaluation", type="primary",
-                    disabled=not session_ids)
+
+input_mode = st.radio("Input mode", ["Session IDs", "CSV files"], horizontal=True)
+
+session_ids = ""
+csv_files = []
+
+if input_mode == "Session IDs":
+    session_ids = st.text_input(
+        label="Session IDs (comma-separated)",
+        key="session_ids",
+    )
+    run_ready = bool(session_ids.strip())
+else:
+    csv_files = st.file_uploader(
+        "Upload chat log CSV files", type=["csv"], accept_multiple_files=True
+    )
+    if csv_files:
+        preview_file = st.selectbox("Preview CSV", [f.name for f in csv_files])
+        for f in csv_files:
+            if f.name == preview_file:
+                try:
+                    df_preview = load_csv_robust(f)
+                    f.seek(0)
+                    st.dataframe(df_preview.head(5), use_container_width=True)
+                except ValueError as e:
+                    st.error(f"Could not preview: {e}")
+                break
+    run_ready = bool(csv_files)
+
+run_btn = st.button("Run Evaluation", type="primary", disabled=not run_ready)
 
 if run_btn:
     all_results: dict[str, dict] = {}
     radar_buffers: dict[str, io.BytesIO] = {}
     competency_names = list(prompts.keys())
 
-    progress = st.progress(0, text="Starting…")
-    
-    sessions = session_ids.split(",") if session_ids else []
+    st.info(f"🔍 Debug — model string: `{model}`")
 
-    status_cols = st.columns(len(sessions))
+    if input_mode == "Session IDs":
+        items = [s.strip() for s in session_ids.split(",") if s.strip()]
+        progress = st.progress(0, text="Starting…")
+        status_cols = st.columns(len(items))
 
+        for i, session_id in enumerate(items):
+            status_cols[i].info(f"⏳ {session_id}")
+            try:
+                df = get_session_chat(session_id)
+            except ValueError as parse_err:
+                status_cols[i].error(f"❌ {session_id}: {parse_err}")
+                continue
 
-    for i, session_id in enumerate(sessions):
-        try:
-            df = get_session_chat(session_id)
-        except ValueError as parse_err:
-            status_cols[i].error(f"❌ {session_id}: {parse_err}")
-            continue
-        status_cols[i].info(f"⏳ {session_id}")
+            with st.spinner(f"Evaluating **{session_id}**…"):
+                result = evaluate_chat_log(
+                    filename=f"{session_id}.csv",
+                    df=df,
+                    prompts=prompts,
+                    model=model,
+                    api_key=api_key,
+                    max_workers=max_workers,
+                    aws_credentials=aws_credentials,
+                    use_params=selected_use_params,
+                )
+            all_results[session_id] = result
+            radar_buffers[session_id] = build_radar_chart(session_id, result, competency_names)
+            status_cols[i].success(f"✅ {session_id}")
+            progress.progress((i + 1) / len(items), text=f"Completed {i + 1}/{len(items)} files")
 
-        with st.spinner(f"Evaluating **{session_id}**…"):
-            result = evaluate_chat_log(
-                filename=f"{session_id}.csv",
-                df=df,
-                prompts=prompts,
-                model=model,
-                api_key=api_key,
-                max_workers=max_workers,
-            )
-        all_results[str(session_id)] = result
-        radar_buffers[str(session_id)] = build_radar_chart(
-            str(session_id), result, competency_names
-        )
-        status_cols[i].success(f"✅ {session_id}")
-        progress.progress((i + 1) / len(sessions),
-                          text=f"Completed {i + 1}/{len(sessions)} files")
-        
+    else:  # CSV mode
+        items = csv_files
+        progress = st.progress(0, text="Starting…")
+        status_cols = st.columns(len(items))
 
-    # for file_idx, csv_file in enumerate(csv_files):
-    #     csv_file.seek(0)
-    #     try:
-    #         df = load_csv_robust(csv_file)
-    #     except ValueError as parse_err:
-    #         status_cols[file_idx].error(f"❌ {csv_file.name}: {parse_err}")
-    #         continue
-    #     status_cols[file_idx].info(f"⏳ {csv_file.name}")
+        for i, csv_file in enumerate(items):
+            status_cols[i].info(f"⏳ {csv_file.name}")
+            csv_file.seek(0)
+            try:
+                df = load_csv_robust(csv_file)
+            except ValueError as parse_err:
+                status_cols[i].error(f"❌ {csv_file.name}: {parse_err}")
+                continue
 
-    #     with st.spinner(f"Evaluating **{csv_file.name}**…"):
-    #         result = evaluate_chat_log(
-    #             filename=csv_file.name,
-    #             df=df,
-    #             prompts=prompts,
-    #             model=model,
-    #             api_key=api_key,
-    #             max_workers=max_workers,
-    #         )
-    #     all_results[csv_file.name] = result
-    #     radar_buffers[csv_file.name] = build_radar_chart(
-    #         csv_file.name, result, competency_names
-    #     )
-    #     status_cols[file_idx].success(f"✅ {csv_file.name}")
-    #     progress.progress((file_idx + 1) / len(csv_files),
-    #                       text=f"Completed {file_idx + 1}/{len(csv_files)} files")
+            with st.spinner(f"Evaluating **{csv_file.name}**…"):
+                result = evaluate_chat_log(
+                    filename=csv_file.name,
+                    df=df,
+                    prompts=prompts,
+                    model=model,
+                    api_key=api_key,
+                    max_workers=max_workers,
+                    aws_credentials=aws_credentials,
+                    use_params=selected_use_params,
+                )
+            all_results[csv_file.name] = result
+            radar_buffers[csv_file.name] = build_radar_chart(csv_file.name, result, competency_names)
+            status_cols[i].success(f"✅ {csv_file.name}")
+            progress.progress((i + 1) / len(items), text=f"Completed {i + 1}/{len(items)} files")
 
     progress.empty()
     st.success("🎉 Evaluation complete!")

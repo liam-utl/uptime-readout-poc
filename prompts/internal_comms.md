@@ -40,3 +40,11 @@ Provide an overall Internal Comms score (1–5), in addition to a conscise, 4-5 
 
 ### Chat Log
 {{chat_log}}
+
+### Output format
+Ensure your output is in the following format:
+{
+    "competency": "Internal Comms",
+    "score": integer score between 1-5,
+    "rationale: Rationale for the score.
+}

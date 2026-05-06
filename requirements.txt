@@ -4,3 +4,4 @@ pydantic
 pandas
 python-pptx
 openpyxl
+boto3>=1.28.57
